@@ -13,6 +13,7 @@ class ProtoLoss(nn.Module):
         self.temperature = args['temperature']
         self.BPA = bpa
         self.num_labeled = None
+        self.bpa_layers = args['bpa_layers']
 
     @staticmethod
     def get_accuracy(probas: torch.Tensor, labels: torch.Tensor):
@@ -27,7 +28,7 @@ class ProtoLoss(nn.Module):
         self.num_labeled = num_way * self.num_shot
 
         # apply the BPA transform
-        if self.BPA is not None:
+        if self.bpa_layers > 0:
             X = self.BPA(X)
 
         X_s, X_q = X[:self.num_labeled], X[self.num_labeled:]

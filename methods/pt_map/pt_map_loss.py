@@ -112,6 +112,8 @@ class MAP:
 class PTMAPLoss(nn.Module):
     def __init__(self, args: dict, lam: float = 10, alpha: float = 0.2, n_epochs: int = 20, bpa=None):
         super().__init__()
+        print("--------------------------------------------------")
+        print(bpa)
         self.way_dict = dict(train=args['train_way'], val=args['val_way'])
         self.num_shot = args['num_shot']
         self.num_query = args['num_query']

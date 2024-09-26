@@ -40,6 +40,7 @@ class BPA(nn.Module):
         """
         Compute the cost matrix.
         """
+        
         # euclidean
         if self.distance_metric == 'euclidean':
             pairwise_dist = torch.cdist(x, x, p=2)

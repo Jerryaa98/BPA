@@ -7,6 +7,7 @@ import torch
 
 import utils
 from bpa import BPA
+import random
 
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -24,7 +25,7 @@ def get_args():
                         help=""" Where to save model checkpoints. If None, it will automatically created. """)
     parser.add_argument('--dataset', type=str, default='miniimagenet',
                         choices=['miniimagenet', 'cifar'])
-    parser.add_argument('--data_path', type=str, default='./datasets/few_shot/miniimagenet',
+    parser.add_argument('--data_path', type=str, default='./datasets/miniimagenet',
                         help="""Path to dataset root directory.""")
 
     parser.add_argument('--backbone', type=str, default='wrn',
@@ -50,8 +51,8 @@ def get_args():
                         help=""" Your wandb entity name. """)
 
     # few-shot specific arguments
-    parser.add_argument('--method', type=str, default='pt_map_bpa',
-                        choices=['proto', 'proto_bpa', 'pt_map', 'pt_map_bpa'],
+    parser.add_argument('--method', type=str, default='pt_map',
+                        choices=['proto', 'pt_map'],
                         help="""Specify which few-shot classifier to use.""")
     parser.add_argument('--train_way', type=int, default=5,
                         help=""" Number of classes for each training task. """)
@@ -108,8 +109,13 @@ def get_args():
     parser.add_argument('--max_scale', type=utils.bool_flag, default=True,
                         help=""" Scaling range of the BPA values to [0,1]. 
                              This should always be True. """)
+    parser.add_argument('--bpa_layers', type=int, default=0, 
+                        help='Number of BPA layers to use after MLPs')
+    parser.add_argument('--freeze_backbone', type=utils.bool_flag, default=False,
+                        help=""" If true, freeze the backbone and stop gradients from propagating through it. """)
 
     return parser.parse_args()
+
 
 
 def main():
@@ -123,30 +129,61 @@ def main():
     if not args.eval:
         train_dataloader = utils.get_dataloader(set_name='train', args=args, constant=False)
         val_dataloader = utils.get_dataloader(set_name='val', args=args, constant=True)
+        print("Train dataloader: ", len(train_dataloader))
+        print("Val dataloader: ", len(val_dataloader))
+
     else:
         val_dataloader = utils.get_dataloader(set_name='test', args=args, constant=False)
         train_dataloader = None
 
     # define model and load pretrained weights if available
-    model = utils.get_model(args.backbone, args)
-    model = model.to(device)
-    utils.load_weights(model, args.pretrained_path)
+    if(args.pretrained_path == "./checkpoints/470.tar"
+       or args.pretrained_path == "../BPA/checkpoints/470.tar"
+       or args.pretrained_path == "./checkpoints/proto-miniimage-1shot.pth"
+       or args.pretrained_path == "./checkpoints/proto-miniimage-5shot.pth"):
+        # pre trained model is regular WRN/resnet network
+        model = utils.get_model(args.backbone, args)
+        utils.load_weights(model, args.pretrained_path)        
+        model = utils.ConstructDynamicModel(model, args)
+        model = model.to(device)
+    else:
+        # loading with custom model with extra BPA and MLP layers
+        model = utils.get_model(args.backbone, args)
+        model = utils.ConstructDynamicModel(model, args)
+        utils.load_weights(model, args.pretrained_path)        
+        model = model.to(device)
+    
+    if(args.pretrained_path is None):
+        # if there's no pretrained model, use default model
+        print("No pretrained model found, using default model")
+        model = utils.get_model(args.backbone, args)
+        model = utils.ConstructDynamicModel(model, args)
+        model = model.to(device)
+    
+    # freeze backbone if needed
+    if args.freeze_backbone:
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+        print("Backbone is frozen. Gradients will not propagate through it.")
 
-    # BPA and few-shot classification method (e.g. proto, pt-map...)
     bpa = None
-    if 'bpa' in args.method.lower():
-        bpa = BPA(
-            distance_metric=args.distance_metric,
-            ot_reg=args.ot_reg,
-            mask_diag=args.mask_diag,
-            sinkhorn_iterations=args.sink_iters,
-            max_scale=args.max_scale
-        )
-    fewshot_method = utils.get_method(args=args, bpa=bpa)
+    bpa = BPA(
+        distance_metric=args.distance_metric,
+        ot_reg=args.ot_reg,
+        mask_diag=args.mask_diag,
+        sinkhorn_iterations=args.sink_iters,
+        max_scale=args.max_scale
+    )
+
+    
+    fewshot_method = utils.get_method(args=args, bpa = bpa)
 
     # few-shot labels
     train_labels = utils.get_fs_labels(args.method, args.train_way, args.num_query, args.num_shot)
     val_labels = utils.get_fs_labels(args.method, args.val_way, args.num_query, args.num_shot)
+
+    print("Few-shot train labels: ", train_labels, " - ", len(train_labels))
+    print("Few-shot val labels: ", val_labels, " - ", len(val_labels))
 
     # initialized wandb
     if args.wandb:
@@ -154,6 +191,11 @@ def main():
 
     # define loss
     criterion = utils.get_criterion_by_method(method=args.method)
+
+    # print model architecture
+    print("Model architecture: ")
+    print(model)
+
 
     # Test-set evaluation
     if args.eval:
@@ -168,7 +210,7 @@ def main():
     if args.eval_first:
         print("Evaluate model before training... ")
         eval_one_epoch(model, val_dataloader, fewshot_method, criterion, val_labels, -1, args, set_name='val')
-
+    
     # train
     print("Start training...")
     best_acc = 0.
@@ -195,7 +237,7 @@ def main():
 
         # save last checkpoint
         torch.save(model.state_dict(), os.path.join(output_dir, 'last.pth'))
-
+    
 
 def train_one_epoch(model, dataloader, optimizer, fewshot_method, criterion, labels, epoch, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -204,6 +246,15 @@ def train_one_epoch(model, dataloader, optimizer, fewshot_method, criterion, lab
     n_batches = len(dataloader)
 
     model.train()
+    
+    # # Shuffle the labels
+    # print("Shuffling labels...")
+    # print("original labels: ", labels)
+    # shuffled_labels = labels.clone()  # Create a copy of labels to shuffle
+    # print("cloned labels: ", shuffled_labels)
+    # random.shuffle(shuffled_labels)   # Shuffle the labels
+    # print("shuffled labels: ", shuffled_labels)
+
     for batch_idx, (images, _) in enumerate(metric_logger.log_every(dataloader, log_freq, header=header)):
         images = images.to(device)
         # extract features
@@ -211,6 +262,7 @@ def train_one_epoch(model, dataloader, optimizer, fewshot_method, criterion, lab
         # few-shot classifier
         probas, accuracy = fewshot_method(features, labels=labels, mode='train')
         q_labels = labels if len(labels) == len(probas) else labels[-len(probas):]
+        
         # loss
         loss = criterion(probas, q_labels)
 

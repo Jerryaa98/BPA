@@ -9,9 +9,12 @@ import numpy as np
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
+import torch.nn as nn
+from bpa import balanced_pairwise_affinities as bpa
 
 from models.wrn_mixup_model import wrn28_10
 from models.resnet12 import Res12
+from models.convnet import Convnet
 from datasets import MiniImageNet, CIFAR, CUB
 from datasets.samplers import CategoriesSampler
 from methods import PTMAPLoss, ProtoLoss
@@ -24,15 +27,57 @@ except Exception as e:
 
 
 MODELS = dict(
-    wrn=wrn28_10, resnet12=Res12
+    wrn=wrn28_10, resnet12=Res12, convnet=Convnet
 )
 DATASETS = dict(
     miniimagenet=MiniImageNet, cifar=CIFAR
 )
 METHODS = dict(
-    pt_map=PTMAPLoss, pt_map_bpa=PTMAPLoss, proto=ProtoLoss, proto_bpa=ProtoLoss,
+    pt_map=PTMAPLoss, proto=ProtoLoss
 )
 
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(SimpleMLP, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.fc(x)
+    
+class DynamicModel(nn.Module):
+    def __init__(self, backbone, sot_args, mlp_input_dim, mlp_hidden_dim, mlp_output_dim, num_layers):
+        super(DynamicModel, self).__init__()
+        self.backbone = backbone
+        self.layers = nn.ModuleList()
+
+        if(num_layers < 0):
+            raise ValueError("Number of layers must be greater than or equal to 0")
+        if(num_layers > 0):
+            # Initialize BPA and MLP layers
+            self.layers.append(bpa.BPA(**sot_args))  # Append First SOT layer
+
+            # add additional layers, including MLP after each transform (if num_layers=0 we get the default version)
+            if(num_layers > 1):
+                for id in range(num_layers-1):
+                    self.layers.append(SimpleMLP(mlp_input_dim, mlp_hidden_dim, mlp_output_dim))  # Append MLP layer
+                    self.layers.append(bpa.BPA(**sot_args))  # Append SOT layer
+
+    def forward(self, x):
+        # Extract features using the backbone model
+        x = self.backbone(x)
+        
+        if(len(self.layers) == 0):
+            return x
+        
+        # Apply SOT and MLP layers alternately
+        for layer in self.layers:
+            x = layer(x)
+        
+        return x
 
 def get_model(model_name: str, args):
     """
@@ -47,6 +92,39 @@ def get_model(model_name: str, args):
     else:
         raise ValueError(f'Model {model_name} not implemented. available models are: {list(MODELS.keys())}')
 
+
+def ConstructDynamicModel(model, args):
+    """
+    Construct the dynamic model.
+    """
+    # output dimension of the feature extractor is 100 in 5 shot, 80 in 1 shot
+    if(args.num_shot == 5):
+        feature_extractor_output_dim = 100  
+        mlp_hidden_dim = 100 
+        mlp_output_dim = 100  
+    elif(args.num_shot == 1):
+        feature_extractor_output_dim = 80  
+        mlp_hidden_dim = 80 
+        mlp_output_dim = 80  
+
+    num_layers = args.bpa_layers
+
+    if(num_layers > 0):
+        # BPA parameters
+        bpa_args = {
+            'distance_metric': args.distance_metric,
+            'ot_reg': args.ot_reg,
+            'mask_diag': args.mask_diag,
+            'sinkhorn_iterations': args.sink_iters,
+            'max_scale': args.max_scale
+        }
+
+    
+
+    # Initialize the dynamic model
+    model = DynamicModel(model, bpa_args, feature_extractor_output_dim, mlp_hidden_dim, mlp_output_dim, num_layers)
+
+    return model
 
 def get_dataloader(set_name: str, args: argparse, constant: bool = False):
     """
@@ -110,7 +188,7 @@ def get_method(args, bpa=None):
     """
 
     if args.method.lower() in METHODS.keys():
-        return METHODS[args.method.lower()](args=vars(args), bpa=bpa)
+        return METHODS[args.method.lower()](args=vars(args), bpa = bpa)
     else:
         raise ValueError(f'Not implemented method. available methods are: {METHODS.keys()}')
 
@@ -164,7 +242,9 @@ def get_output_dir(args: argparse):
                    f'-n_shot={args.num_shot}' \
                    f'-lr={args.lr}' \
                    f'-scheduler={args.scheduler}' \
-                   f'-dropout={args.dropout}'
+                   f'-dropout={args.dropout}' \
+                   f'bpa_layers={args.bpa_layers}' \
+                   f'freeze_backbone={args.freeze_backbone}' 
 
         checkpoint_dir = os.path.join(checkpoint_dir, name_str)
     else:
